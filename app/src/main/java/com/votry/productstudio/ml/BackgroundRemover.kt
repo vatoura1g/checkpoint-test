@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import com.votry.productstudio.cloud.CloudflareAiClient
 import com.votry.productstudio.cloud.CloudflareConfigStore
 import com.votry.productstudio.ml.sam.TargetMask
+import com.votry.productstudio.ml.sam.TargetMaskCleaner
 import java.io.File
 
 class BackgroundRemover {
@@ -13,18 +14,21 @@ class BackgroundRemover {
         target: TargetMask,
         onProgress: (Int, String) -> Unit,
     ): Bitmap {
+        val cleanedTarget = TargetMaskCleaner.keepLargestComponent(target)
         val context = GhaziRuntime.contextOrNull()
         if (context != null) {
             val config = CloudflareConfigStore(context).load()
             if (config != null) {
-                try {
-                    val matte = MatteAnalyzer().analyze(source, modelFile, onProgress)
-                    return CloudflareAiClient().enhance(source, target, matte, config, onProgress)
-                } catch (_: Throwable) {
-                    onProgress(76, "AI Ultra indisponible — mode local…")
+                onProgress(44, "AI ULTRA activé ✓")
+                val matte = MatteAnalyzer().analyze(source, modelFile, onProgress)
+                return try {
+                    CloudflareAiClient().enhance(source, cleanedTarget, matte, config, onProgress)
+                } catch (t: Throwable) {
+                    throw IllegalStateException("AI Ultra a échoué : ${t.message ?: t.javaClass.simpleName}", t)
                 }
             }
         }
-        return LocalBackgroundRemover().process(source, modelFile, target, onProgress)
+        onProgress(44, "Mode LOCAL")
+        return LocalBackgroundRemover().process(source, modelFile, cleanedTarget, onProgress)
     }
 }
