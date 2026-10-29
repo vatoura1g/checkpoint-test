@@ -19,6 +19,17 @@ jobs:
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
+      - name: Bundle pinned MobileSAM models
+        run: |
+          mkdir -p app/src/main/assets
+          curl -L --fail --retry 3 --retry-delay 2 \
+            "https://raw.githubusercontent.com/ooooooomg/mobilesam-android/a7873735900add16b4ebab745583ef8b35903c92/app/src/main/assets/mobile_sam_encoder.onnx" \
+            -o app/src/main/assets/mobile_sam_encoder.onnx
+          curl -L --fail --retry 3 --retry-delay 2 \
+            "https://raw.githubusercontent.com/ooooooomg/mobilesam-android/a7873735900add16b4ebab745583ef8b35903c92/app/src/main/assets/mobile_sam_decoder.onnx" \
+            -o app/src/main/assets/mobile_sam_decoder.onnx
+          test $(stat -c%s app/src/main/assets/mobile_sam_encoder.onnx) -gt 27000000
+          test $(stat -c%s app/src/main/assets/mobile_sam_decoder.onnx) -gt 16000000
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
@@ -28,6 +39,6 @@ jobs:
         run: gradle --no-daemon :app:assembleDebug
       - uses: actions/upload-artifact@v4
         with:
-          name: ProductStudio-debug-apk
+          name: Ghazi-v0.3-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

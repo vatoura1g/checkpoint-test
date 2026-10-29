@@ -15,9 +15,11 @@ import kotlinx.coroutines.withContext
 
 object ImageTools {
     private const val PROCESSING_MAX_EDGE = 3200
+    private const val SELECTION_MAX_EDGE = 1800
     private const val PREVIEW_MAX_EDGE = 1600
 
     fun decodeForProcessing(file: File): Bitmap = decodeOrientedBounded(file, PROCESSING_MAX_EDGE)
+    fun decodeForSelection(file: File): Bitmap = decodeOrientedBounded(file, SELECTION_MAX_EDGE)
 
     fun decodePreview(file: File): Bitmap {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -39,11 +41,9 @@ object ImageTools {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.absolutePath, bounds)
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) throw IllegalStateException("Photo illisible")
-
         val longest = max(bounds.outWidth, bounds.outHeight)
         var sample = 1
         while (longest / (sample * 2) >= maxEdge) sample *= 2
-
         val decoded = BitmapFactory.decodeFile(
             file.absolutePath,
             BitmapFactory.Options().apply {
@@ -60,10 +60,7 @@ object ImageTools {
             ExifInterface.ORIENTATION_ROTATE_270 -> 270f
             else -> 0f
         }
-
-        val oriented = if (degrees == 0f) {
-            decoded
-        } else {
+        val oriented = if (degrees == 0f) decoded else {
             val matrix = Matrix().apply { postRotate(degrees) }
             Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true).also {
                 if (it !== decoded) decoded.recycle()

@@ -4,9 +4,11 @@ import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.graphics.Bitmap
+import com.votry.productstudio.ml.sam.TargetMask
 import com.votry.productstudio.processing.PixelMath
 import java.io.File
 import java.nio.FloatBuffer
+import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.floor
 import kotlin.math.max
@@ -16,172 +18,220 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 
 class BackgroundRemover {
-    private val env = OrtEnvironment.getEnvironment()
+    private val environment = OrtEnvironment.getEnvironment()
 
     suspend fun process(
         source: Bitmap,
         modelFile: File,
+        target: TargetMask,
         onProgress: (Int, String) -> Unit,
     ): Bitmap = withContext(Dispatchers.Default) {
         ensureActive()
-        onProgress(8, "Analyse du produit…")
-
-        // V0.2 intentionally uses the CPU execution provider first. It is slower than NNAPI on
-        // some devices, but far more predictable across Android vendors and avoids native crashes.
+        onProgress(46, "Analyse fine du verre…")
         val options = OrtSession.SessionOptions().apply {
+            setIntraOpNumThreads(4)
+            setInterOpNumThreads(1)
             setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
         }
 
-        env.createSession(modelFile.absolutePath, options).use { session ->
-            ensureActive()
-            onProgress(20, "Préparation haute qualité…")
-            val input = ImagePreprocessor.prepareInput(source)
-            val shape = longArrayOf(1, 3, ModelConfig.SIZE.toLong(), ModelConfig.SIZE.toLong())
-            val inputName = session.inputNames.first()
+        try {
+            environment.createSession(modelFile.absolutePath, options).use { session ->
+                onProgress(54, "Calcul de la transparence…")
+                val input = ImagePreprocessor.prepareInput(source)
+                val shape = longArrayOf(1, 3, ModelConfig.SIZE.toLong(), ModelConfig.SIZE.toLong())
+                val inputName = session.inputNames.first()
 
-            onProgress(38, "Détection du produit et du verre…")
-            val rawMask: FloatArray
-            var maskWidth: Int
-            var maskHeight: Int
-            OnnxTensor.createTensor(env, FloatBuffer.wrap(input), shape).use { tensor ->
-                session.run(mapOf(inputName to tensor)).use { result ->
-                    val output = result[0] as OnnxTensor
-                    val outputShape = output.info.shape
-                    maskHeight = outputShape[outputShape.size - 2].toInt()
-                    maskWidth = outputShape[outputShape.size - 1].toInt()
-                    rawMask = FloatArray(maskWidth * maskHeight)
-                    val buffer = output.floatBuffer
-                    buffer.rewind()
-                    buffer.get(rawMask, 0, min(rawMask.size, buffer.remaining()))
+                val rawMask: FloatArray
+                var maskWidth: Int
+                var maskHeight: Int
+                OnnxTensor.createTensor(environment, FloatBuffer.wrap(input), shape).use { tensor ->
+                    session.run(mapOf(inputName to tensor)).use { result ->
+                        val output = result[0] as OnnxTensor
+                        val outputShape = output.info.shape
+                        maskHeight = outputShape[outputShape.size - 2].toInt()
+                        maskWidth = outputShape[outputShape.size - 1].toInt()
+                        rawMask = FloatArray(maskWidth * maskHeight)
+                        val buffer = output.floatBuffer
+                            ?: throw IllegalStateException("Le moteur de transparence n'a pas produit de masque.")
+                        buffer.get(rawMask, 0, min(rawMask.size, buffer.remaining()))
+                    }
                 }
+
+                ensureActive()
+                onProgress(72, "Séparation du produit et du décor…")
+                val matte = normalizeSigmoid(rawMask)
+
+                ensureActive()
+                onProgress(84, "Nettoyage des zones transparentes…")
+                val result = composeSelectedProduct(
+                    source = source,
+                    matte = matte,
+                    matteWidth = maskWidth,
+                    matteHeight = maskHeight,
+                    target = target,
+                )
+                onProgress(94, "Finition des reflets et contours…")
+                result
             }
-
-            ensureActive()
-            onProgress(68, "Affinage des transparences…")
-            val alpha = normalizeSigmoid(rawMask)
-
-            ensureActive()
-            onProgress(82, "Nettoyage du fond…")
-            val result = composeWhiteMemorySafe(source, alpha, maskWidth, maskHeight)
-            onProgress(94, "Finition du verre et des reflets…")
-            result
-        }.also {
+        } finally {
             options.close()
         }
     }
 
     private fun normalizeSigmoid(raw: FloatArray): FloatArray {
-        var lo = Float.MAX_VALUE
-        var hi = -Float.MAX_VALUE
+        var low = Float.MAX_VALUE
+        var high = -Float.MAX_VALUE
         val alpha = FloatArray(raw.size)
         for (i in raw.indices) {
-            val value = (1f / (1f + exp(-raw[i]))).coerceIn(0f, 1f)
+            val value = (1f / (1f + exp(-raw[i].coerceIn(-20f, 20f)))).coerceIn(0f, 1f)
             alpha[i] = value
-            lo = min(lo, value)
-            hi = max(hi, value)
+            low = min(low, value)
+            high = max(high, value)
         }
-        val range = max(hi - lo, 1e-6f)
-        for (i in alpha.indices) {
-            alpha[i] = ((alpha[i] - lo) / range).coerceIn(0f, 1f)
-        }
+        val range = max(high - low, 1e-6f)
+        for (i in alpha.indices) alpha[i] = ((alpha[i] - low) / range).coerceIn(0f, 1f)
         return alpha
     }
 
-    private fun composeWhiteMemorySafe(source: Bitmap, alpha: FloatArray, mw: Int, mh: Int): Bitmap {
+    private fun composeSelectedProduct(
+        source: Bitmap,
+        matte: FloatArray,
+        matteWidth: Int,
+        matteHeight: Int,
+        target: TargetMask,
+    ): Bitmap {
         val width = source.width
         val height = source.height
         val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val background = estimateBackground(source)
-        val bounds = alphaBounds(alpha, mw, mh)
-        val stripeRows = 96
+        val backgroundLuma = luma(background.first, background.second, background.third)
+        val targetBounds = target.bounds(0.45f)
+        val stripeRows = 80
         val sourceStripe = IntArray(width * stripeRows)
         val outputStripe = IntArray(width * stripeRows)
 
         var y0 = 0
         while (y0 < height) {
             val rows = min(stripeRows, height - y0)
-            val count = width * rows
             source.getPixels(sourceStripe, 0, width, 0, y0, width, rows)
-
             for (row in 0 until rows) {
                 val y = y0 + row
+                val ny = if (height <= 1) 0f else y.toFloat() / (height - 1).toFloat()
                 for (x in 0 until width) {
                     val i = row * width + x
-                    val aFloat = sampleAlphaBilinear(alpha, mw, mh, x, y, width, height)
-                    if (aFloat <= 0.022f) {
-                        outputStripe[i] = shadowPixelOrWhite(x, y, width, height, bounds, mw, mh)
+                    val nx = if (width <= 1) 0f else x.toFloat() / (width - 1).toFloat()
+                    val targetProbability = target.sampleNormalized(nx, ny)
+                    val gate = smoothStep(0.34f, 0.62f, targetProbability)
+                    if (gate <= 0.01f) {
+                        outputStripe[i] = shadowOrWhite(nx, ny, targetBounds)
                         continue
                     }
 
-                    val a = (aFloat * 255f).toInt().coerceIn(0, 255)
                     val pixel = sourceStripe[i]
-                    val sr = (pixel shr 16) and 0xFF
-                    val sg = (pixel shr 8) and 0xFF
-                    val sb = pixel and 0xFF
+                    val red = (pixel shr 16) and 0xFF
+                    val green = (pixel shr 8) and 0xFF
+                    val blue = pixel and 0xFF
+                    val sourceLuma = luma(red, green, blue)
+                    val matteAlpha = sampleBilinear(
+                        matte,
+                        matteWidth,
+                        matteHeight,
+                        nx,
+                        ny,
+                    )
 
-                    // Opaque areas are deliberately untouched. This protects labels, tickets,
-                    // logos, barcodes and Arabic lettering instead of redrawing them.
-                    val preserveSource = aFloat >= 0.84f
-                    val (foregroundR, foregroundG, foregroundB) = if (preserveSource || aFloat < 0.09f) {
-                        Triple(sr, sg, sb)
+                    // A small optical floor lets real transparent rims/highlights survive even
+                    // when a foreground model underestimates clear glass.
+                    val luminanceDifference = abs(sourceLuma - backgroundLuma) / 255f
+                    val channelSpread = (max(red, max(green, blue)) - min(red, min(green, blue))) / 255f
+                    val opticalFloor = (0.025f + luminanceDifference * 0.42f + channelSpread * 0.08f)
+                        .coerceIn(0.025f, 0.30f)
+
+                    // Very confident matte pixels are treated as true opaque detail (ticket,
+                    // printed mark, rim, barcode, logo). Everything else is treated as glass and
+                    // is intentionally prevented from becoming an opaque copy of the old scene.
+                    val opaqueDetail = matteAlpha >= 0.94f && targetProbability >= 0.62f
+                    val combinedAlpha = if (opaqueDetail) {
+                        (gate * matteAlpha).coerceIn(0f, 1f)
                     } else {
-                        // Conservative scene-colour decontamination for semi-transparent glass.
-                        val denominator = max(aFloat, 0.14f)
-                        Triple(
-                            ((sr - (1f - aFloat) * background.first) / denominator).toInt().coerceIn(0, 255),
-                            ((sg - (1f - aFloat) * background.second) / denominator).toInt().coerceIn(0, 255),
-                            ((sb - (1f - aFloat) * background.third) / denominator).toInt().coerceIn(0, 255),
-                        )
+                        (gate * max(matteAlpha * 0.70f, opticalFloor)).coerceIn(0f, 0.78f)
+                    }
+                    if (combinedAlpha <= 0.015f) {
+                        outputStripe[i] = shadowOrWhite(nx, ny, targetBounds)
+                        continue
                     }
 
-                    val red = PixelMath.compositeChannel(foregroundR, a)
-                    val green = PixelMath.compositeChannel(foregroundG, a)
-                    val blue = PixelMath.compositeChannel(foregroundB, a)
-                    outputStripe[i] = (0xFF shl 24) or (red shl 16) or (green shl 8) or blue
+                    val foreground = if (opaqueDetail) {
+                        Triple(red, green, blue)
+                    } else {
+                        neutralGlassForeground(
+                            red = red,
+                            green = green,
+                            blue = blue,
+                            sourceLuma = sourceLuma,
+                            backgroundLuma = backgroundLuma,
+                        )
+                    }
+                    val alpha255 = (combinedAlpha * 255f).toInt().coerceIn(0, 255)
+                    val outR = PixelMath.compositeChannel(foreground.first, alpha255)
+                    val outG = PixelMath.compositeChannel(foreground.second, alpha255)
+                    val outB = PixelMath.compositeChannel(foreground.third, alpha255)
+                    outputStripe[i] = (0xFF shl 24) or (outR shl 16) or (outG shl 8) or outB
                 }
             }
-
             output.setPixels(outputStripe, 0, width, 0, y0, width, rows)
-            // Clear only the part used so stale pixels cannot leak into the last stripe.
-            for (i in 0 until count) outputStripe[i] = 0
             y0 += rows
         }
         return output
     }
 
-    private fun sampleAlphaBilinear(
-        alpha: FloatArray,
-        mw: Int,
-        mh: Int,
-        x: Int,
-        y: Int,
+    private fun neutralGlassForeground(
+        red: Int,
+        green: Int,
+        blue: Int,
+        sourceLuma: Float,
+        backgroundLuma: Float,
+    ): Triple<Int, Int, Int> {
+        // Keep a small amount of photographed brightness/reflection while strongly reducing
+        // old-scene colour. This is deliberately non-generative and never invents texture.
+        val residual = sourceLuma - backgroundLuma
+        val neutral = (232f + residual * 0.22f).coerceIn(175f, 252f)
+        val chromaRetention = 0.07f
+        val outR = (neutral + (red - sourceLuma) * chromaRetention).toInt().coerceIn(0, 255)
+        val outG = (neutral + (green - sourceLuma) * chromaRetention).toInt().coerceIn(0, 255)
+        val outB = (neutral + (blue - sourceLuma) * chromaRetention).toInt().coerceIn(0, 255)
+        return Triple(outR, outG, outB)
+    }
+
+    private fun sampleBilinear(
+        values: FloatArray,
         width: Int,
         height: Int,
+        nx: Float,
+        ny: Float,
     ): Float {
-        val fx = if (width <= 1) 0f else x.toFloat() * (mw - 1).toFloat() / (width - 1).toFloat()
-        val fy = if (height <= 1) 0f else y.toFloat() * (mh - 1).toFloat() / (height - 1).toFloat()
-        val x0 = floor(fx).toInt().coerceIn(0, mw - 1)
-        val y0 = floor(fy).toInt().coerceIn(0, mh - 1)
-        val x1 = min(x0 + 1, mw - 1)
-        val y1 = min(y0 + 1, mh - 1)
-        val tx = fx - x0
-        val ty = fy - y0
-        val top = alpha[y0 * mw + x0] * (1f - tx) + alpha[y0 * mw + x1] * tx
-        val bottom = alpha[y1 * mw + x0] * (1f - tx) + alpha[y1 * mw + x1] * tx
+        val x = nx.coerceIn(0f, 1f) * (width - 1).coerceAtLeast(0)
+        val y = ny.coerceIn(0f, 1f) * (height - 1).coerceAtLeast(0)
+        val x0 = floor(x).toInt().coerceIn(0, width - 1)
+        val y0 = floor(y).toInt().coerceIn(0, height - 1)
+        val x1 = min(x0 + 1, width - 1)
+        val y1 = min(y0 + 1, height - 1)
+        val tx = x - x0
+        val ty = y - y0
+        val top = values[y0 * width + x0] * (1f - tx) + values[y0 * width + x1] * tx
+        val bottom = values[y1 * width + x0] * (1f - tx) + values[y1 * width + x1] * tx
         return (top * (1f - ty) + bottom * ty).coerceIn(0f, 1f)
     }
 
     private fun estimateBackground(bitmap: Bitmap): Triple<Int, Int, Int> {
-        val width = bitmap.width
-        val height = bitmap.height
-        val sample = max(8, min(width, height) / 18)
+        val sample = max(8, min(bitmap.width, bitmap.height) / 18)
+        val buffer = IntArray(sample * sample)
         var red = 0L
         var green = 0L
         var blue = 0L
         var count = 0L
-        val buffer = IntArray(sample * sample)
 
-        fun sampleCorner(x: Int, y: Int) {
+        fun addCorner(x: Int, y: Int) {
             bitmap.getPixels(buffer, 0, sample, x, y, sample, sample)
             for (pixel in buffer) {
                 red += (pixel shr 16) and 0xFF
@@ -190,59 +240,36 @@ class BackgroundRemover {
                 count++
             }
         }
-
-        sampleCorner(0, 0)
-        sampleCorner(max(0, width - sample), 0)
-        sampleCorner(0, max(0, height - sample))
-        sampleCorner(max(0, width - sample), max(0, height - sample))
+        addCorner(0, 0)
+        addCorner(max(0, bitmap.width - sample), 0)
+        addCorner(0, max(0, bitmap.height - sample))
+        addCorner(max(0, bitmap.width - sample), max(0, bitmap.height - sample))
         if (count == 0L) return Triple(255, 255, 255)
         return Triple((red / count).toInt(), (green / count).toInt(), (blue / count).toInt())
     }
 
-    private data class AlphaBounds(val left: Int, val top: Int, val right: Int, val bottom: Int)
-
-    private fun alphaBounds(alpha: FloatArray, width: Int, height: Int): AlphaBounds {
-        var left = width
-        var top = height
-        var right = 0
-        var bottom = 0
-        for (y in 0 until height) {
-            for (x in 0 until width) {
-                if (alpha[y * width + x] > 0.12f) {
-                    left = min(left, x)
-                    top = min(top, y)
-                    right = max(right, x)
-                    bottom = max(bottom, y)
-                }
-            }
-        }
-        if (left > right || top > bottom) return AlphaBounds(0, 0, width - 1, height - 1)
-        return AlphaBounds(left, top, right, bottom)
+    private fun shadowOrWhite(nx: Float, ny: Float, bounds: TargetMask.Bounds?): Int {
+        if (bounds == null) return 0xFFFFFFFF.toInt()
+        val objectWidth = bounds.width.coerceAtLeast(0.02f)
+        val centerX = bounds.centerX
+        val centerY = (bounds.bottom + 0.012f).coerceAtMost(0.995f)
+        val radiusX = objectWidth * 0.34f
+        val radiusY = max(0.006f, bounds.height * 0.018f)
+        val dx = (nx - centerX) / radiusX
+        val dy = (ny - centerY) / radiusY
+        val distance = dx * dx * 2.0f + dy * dy * 2.8f
+        if (distance > 6.0f) return 0xFFFFFFFF.toInt()
+        val strength = (exp(-distance) * 0.09f).coerceIn(0f, 0.09f)
+        if (strength < 0.004f) return 0xFFFFFFFF.toInt()
+        val value = (255f * (1f - strength) + 185f * strength).toInt().coerceIn(0, 255)
+        return (0xFF shl 24) or (value shl 16) or (value shl 8) or value
     }
 
-    private fun shadowPixelOrWhite(
-        x: Int,
-        y: Int,
-        width: Int,
-        height: Int,
-        bounds: AlphaBounds,
-        maskWidth: Int,
-        maskHeight: Int,
-    ): Int {
-        val left = bounds.left.toFloat() / maskWidth * width
-        val right = bounds.right.toFloat() / maskWidth * width
-        val bottom = bounds.bottom.toFloat() / maskHeight * height
-        val objectWidth = max(1f, right - left)
-        val centerX = (left + right) * 0.5f
-        val radiusX = max(18f, objectWidth * 0.34f)
-        val radiusY = max(6f, height * 0.012f)
-        val centerY = min(height - 1f, bottom + radiusY * 0.35f)
-        val dx = (x - centerX) / radiusX
-        val dy = (y - centerY) / radiusY
-        if (dx * dx > 1.8f || dy * dy > 2.2f) return 0xFFFFFFFF.toInt()
-        val strength = (exp(-(dx * dx * 2.0f + dy * dy * 2.8f)) * 0.10f).coerceIn(0f, 0.10f)
-        if (strength < 0.006f) return 0xFFFFFFFF.toInt()
-        val value = (255f * (1f - strength) + 188f * strength).toInt().coerceIn(0, 255)
-        return (0xFF shl 24) or (value shl 16) or (value shl 8) or value
+    private fun luma(red: Int, green: Int, blue: Int): Float =
+        red * 0.2126f + green * 0.7152f + blue * 0.0722f
+
+    private fun smoothStep(edge0: Float, edge1: Float, value: Float): Float {
+        val t = ((value - edge0) / (edge1 - edge0)).coerceIn(0f, 1f)
+        return t * t * (3f - 2f * t)
     }
 }
