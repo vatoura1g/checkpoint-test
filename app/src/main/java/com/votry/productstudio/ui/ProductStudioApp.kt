@@ -123,7 +123,7 @@ private fun PermissionPage(onRequest: () -> Unit) {
         Spacer(Modifier.height(24.dp))
         Text("Autorisez la caméra une seule fois pour prendre les photos.", fontSize = 18.sp)
         Spacer(Modifier.height(30.dp))
-        BigButton("AUTORISER LA CAMÉRA", onRequest)
+        BigButton("AUTORISER LA CAMÉRA", onClick = onRequest)
     }
 }
 
