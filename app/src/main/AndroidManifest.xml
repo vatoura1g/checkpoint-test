@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="true"
-        android:label="Photo Produit"
+        android:label="Ghazi"
         android:supportsRtl="true"
         android:theme="@style/Theme.ProductStudio">
         <activity
