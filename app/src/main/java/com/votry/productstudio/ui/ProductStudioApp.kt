@@ -54,6 +54,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.votry.productstudio.camera.CameraCapture
+import com.votry.productstudio.enhance.RealEsrganEnhancer
 import com.votry.productstudio.ml.BackgroundRemover
 import com.votry.productstudio.ml.ModelDownloader
 import com.votry.productstudio.ml.sam.TargetSelector
@@ -72,6 +73,7 @@ private sealed interface Screen {
         val width: Int,
         val height: Int,
         val autoSaved: Boolean,
+        val enhanced: Boolean,
     ) : Screen
     data class Error(val message: String) : Screen
 }
@@ -122,9 +124,11 @@ fun ProductStudioApp() {
                         appScope.launch {
                             var source: Bitmap? = null
                             var processed: Bitmap? = null
+                            var enhancedBitmap: Bitmap? = null
                             var framed: Bitmap? = null
                             var cacheFile: File? = null
                             var savedToGallery = false
+                            var enhanceSucceeded = false
                             try {
                                 source = ImageTools.decodeForProcessing(current.file)
                                 val target = TargetSelector(context).select(source!!, nx, ny) { progress, message ->
@@ -138,23 +142,34 @@ fun ProductStudioApp() {
                                     screen = Screen.Processing(message, progress)
                                 }
 
-                                screen = Screen.Processing("Cadrage catalogue…", 96)
-                                framed = CatalogFramer.frame(processed!!, target)
+                                // Final local restoration pass. Real-ESRGAN improves perceived detail while
+                                // a conservative blend keeps strong text/label pixels from being rewritten.
+                                enhancedBitmap = try {
+                                    RealEsrganEnhancer(context).enhance(processed!!) { p, message ->
+                                        val mapped = 95 + (p.coerceIn(0, 100) * 3 / 100)
+                                        screen = Screen.Processing(message, mapped)
+                                    }.also { enhanceSucceeded = true }
+                                } catch (_: Throwable) {
+                                    screen = Screen.Processing("Enhance HD indisponible — finition standard…", 98)
+                                    null
+                                }
+
+                                screen = Screen.Processing("Cadrage catalogue…", 98)
+                                val frameInput = enhancedBitmap ?: processed!!
+                                framed = CatalogFramer.frame(frameInput, target)
                                 val resultWidth = framed!!.width
                                 val resultHeight = framed!!.height
                                 cacheFile = ImageTools.writeResultCache(context, framed!!)
 
                                 framed!!.recycle(); framed = null
+                                enhancedBitmap?.takeIf { !it.isRecycled }?.recycle(); enhancedBitmap = null
                                 processed!!.recycle(); processed = null
                                 source!!.recycle(); source = null
 
-                                // Save BEFORE rendering the result screen. If Compose or preview decoding
-                                // has any device-specific issue, the finished image is already safe in the gallery.
-                                screen = Screen.Processing("Enregistrement automatique…", 98)
+                                screen = Screen.Processing("Enregistrement automatique…", 99)
                                 ImageTools.saveCachedResultToGallery(context, cacheFile!!)
                                 savedToGallery = true
 
-                                screen = Screen.Processing("Ouverture du résultat…", 99)
                                 val preview = try {
                                     ImageTools.decodePreview(cacheFile!!)
                                 } catch (previewError: Throwable) {
@@ -165,24 +180,24 @@ fun ProductStudioApp() {
                                     return@launch
                                 }
 
-                                // Do not hold on a synthetic 100% processing screen. The result itself is 100%.
                                 screen = Screen.Result(
                                     file = cacheFile!!,
                                     preview = preview,
                                     width = resultWidth,
                                     height = resultHeight,
                                     autoSaved = savedToGallery,
+                                    enhanced = enhanceSucceeded,
                                 )
                             } catch (oom: OutOfMemoryError) {
                                 framed?.takeIf { !it.isRecycled }?.recycle()
+                                enhancedBitmap?.takeIf { !it.isRecycled }?.recycle()
                                 processed?.takeIf { !it.isRecycled }?.recycle()
                                 source?.takeIf { !it.isRecycled }?.recycle()
                                 val savedNote = if (savedToGallery) " La photo finale est déjà enregistrée dans Pictures/Ghazi." else ""
-                                screen = Screen.Error(
-                                    "La mémoire du téléphone est insuffisante pour afficher le résultat.$savedNote",
-                                )
+                                screen = Screen.Error("La mémoire du téléphone est insuffisante pour afficher le résultat.$savedNote")
                             } catch (t: Throwable) {
                                 framed?.takeIf { !it.isRecycled }?.recycle()
+                                enhancedBitmap?.takeIf { !it.isRecycled }?.recycle()
                                 processed?.takeIf { !it.isRecycled }?.recycle()
                                 source?.takeIf { !it.isRecycled }?.recycle()
                                 val savedNote = if (savedToGallery) " La photo finale est déjà enregistrée dans Pictures/Ghazi." else ""
@@ -407,7 +422,7 @@ private fun ProcessingPage(text: String, progress: Int?) {
             Text("${progress.coerceIn(0, 100)} %", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = Color.Black)
         }
         Spacer(Modifier.height(12.dp))
-        Text("Ghazi isole le produit avant de traiter le verre.", fontSize = 15.sp, color = Color(0xFF666666))
+        Text("Ghazi isole, reconstruit puis améliore le produit.", fontSize = 15.sp, color = Color(0xFF666666))
         Spacer(Modifier.height(24.dp))
         Signature()
     }
@@ -421,6 +436,12 @@ private fun ResultPage(current: Screen.Result, onSaveCopy: () -> Unit, onRetake:
     ) {
         BrandHeader("Photo prête ✓")
         Text("${current.width} × ${current.height} px · Catalogue 4:5", fontSize = 14.sp, color = Color(0xFF666666))
+        Spacer(Modifier.height(4.dp))
+        Text(
+            if (current.enhanced) "Enhance HD ✓" else "Finition standard",
+            fontSize = 14.sp,
+            color = if (current.enhanced) Color(0xFF2E6B3A) else Color(0xFF777777),
+        )
         if (current.autoSaved) {
             Spacer(Modifier.height(4.dp))
             Text("Enregistrée automatiquement dans Pictures/Ghazi ✓", fontSize = 14.sp, color = Color(0xFF2E6B3A))

@@ -1,11 +1,12 @@
 # Open-source notices
 
-Ghazi is assembled using ideas and/or adapted code patterns from compatible open-source projects.
+Ghazi is assembled using compatible open-source components and adapted implementation patterns.
 
-- MRJOHN5ON/cel-android — MIT License — ONNX Runtime background-removal architecture, BiRefNet model configuration and preprocessing/postprocessing references.
+- MRJOHN5ON/cel-android — MIT License — Android ONNX Runtime background-removal architecture and BiRefNet integration references.
+- MobileSAM — Apache-2.0 — promptable target-product segmentation concepts/models.
 - LibreStatic/opencinecam — Apache-2.0 — exposure-bracketing design reference.
-- danielgatis/rembg — MIT License — BiRefNet model release hosting/ecosystem.
-- ooooooomg/mobilesam-android — Apache-2.0 — adapted Android ONNX MobileSAM encoder/decoder integration. Ghazi modifies the still-image flow and uses direct user point prompts; no YOLO/AGPL component is included.
-- ChaoningZhang/MobileSAM — Apache-2.0 — MobileSAM model architecture and model weights used for local target selection.
+- danielgatis/rembg — MIT License — background-removal model ecosystem.
+- Parasaran-Python/pixelclarity-android — open-source Android implementation reference for tiled Real-ESRGAN ONNX inference, on-demand model storage and memory-safe enhancement.
+- xinntao/Real-ESRGAN — BSD-3-Clause — Real-ESRGAN architecture and model weights used by the optional Enhance HD stage.
 
 The application also uses AndroidX (Apache-2.0), ONNX Runtime (MIT), Kotlin (Apache-2.0) and other dependencies distributed under their respective licenses.
