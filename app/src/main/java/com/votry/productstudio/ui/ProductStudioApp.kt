@@ -60,14 +60,19 @@ import com.votry.productstudio.ml.sam.TargetSelector
 import com.votry.productstudio.processing.CatalogFramer
 import com.votry.productstudio.processing.ImageTools
 import java.io.File
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private sealed interface Screen {
     data object Camera : Screen
     data class Select(val file: File, val preview: Bitmap) : Screen
     data class Processing(val text: String, val progress: Int? = null) : Screen
-    data class Result(val file: File, val preview: Bitmap, val width: Int, val height: Int) : Screen
+    data class Result(
+        val file: File,
+        val preview: Bitmap,
+        val width: Int,
+        val height: Int,
+        val autoSaved: Boolean,
+    ) : Screen
     data class Error(val message: String) : Screen
 }
 
@@ -118,6 +123,8 @@ fun ProductStudioApp() {
                             var source: Bitmap? = null
                             var processed: Bitmap? = null
                             var framed: Bitmap? = null
+                            var cacheFile: File? = null
+                            var savedToGallery = false
                             try {
                                 source = ImageTools.decodeForProcessing(current.file)
                                 val target = TargetSelector(context).select(source!!, nx, ny) { progress, message ->
@@ -130,31 +137,56 @@ fun ProductStudioApp() {
                                 processed = BackgroundRemover().process(source!!, model, target) { progress, message ->
                                     screen = Screen.Processing(message, progress)
                                 }
+
                                 screen = Screen.Processing("Cadrage catalogue…", 96)
                                 framed = CatalogFramer.frame(processed!!, target)
                                 val resultWidth = framed!!.width
                                 val resultHeight = framed!!.height
-                                val cacheFile = ImageTools.writeResultCache(context, framed!!)
+                                cacheFile = ImageTools.writeResultCache(context, framed!!)
 
                                 framed!!.recycle(); framed = null
                                 processed!!.recycle(); processed = null
                                 source!!.recycle(); source = null
 
-                                screen = Screen.Processing("Préparation de l'aperçu…", 99)
-                                val preview = ImageTools.decodePreview(cacheFile)
-                                screen = Screen.Processing("Terminé", 100)
-                                delay(160)
-                                screen = Screen.Result(cacheFile, preview, resultWidth, resultHeight)
+                                // Save BEFORE rendering the result screen. If Compose or preview decoding
+                                // has any device-specific issue, the finished image is already safe in the gallery.
+                                screen = Screen.Processing("Enregistrement automatique…", 98)
+                                ImageTools.saveCachedResultToGallery(context, cacheFile!!)
+                                savedToGallery = true
+
+                                screen = Screen.Processing("Ouverture du résultat…", 99)
+                                val preview = try {
+                                    ImageTools.decodePreview(cacheFile!!)
+                                } catch (previewError: Throwable) {
+                                    screen = Screen.Error(
+                                        "La photo a bien été enregistrée dans Pictures/Ghazi, mais l'aperçu n'a pas pu s'ouvrir : " +
+                                            (previewError.message ?: previewError.javaClass.simpleName),
+                                    )
+                                    return@launch
+                                }
+
+                                // Do not hold on a synthetic 100% processing screen. The result itself is 100%.
+                                screen = Screen.Result(
+                                    file = cacheFile!!,
+                                    preview = preview,
+                                    width = resultWidth,
+                                    height = resultHeight,
+                                    autoSaved = savedToGallery,
+                                )
                             } catch (oom: OutOfMemoryError) {
                                 framed?.takeIf { !it.isRecycled }?.recycle()
                                 processed?.takeIf { !it.isRecycled }?.recycle()
                                 source?.takeIf { !it.isRecycled }?.recycle()
-                                screen = Screen.Error("La photo est trop lourde pour la mémoire disponible. Reprenez la photo un peu plus près du produit.")
+                                val savedNote = if (savedToGallery) " La photo finale est déjà enregistrée dans Pictures/Ghazi." else ""
+                                screen = Screen.Error(
+                                    "La mémoire du téléphone est insuffisante pour afficher le résultat.$savedNote",
+                                )
                             } catch (t: Throwable) {
                                 framed?.takeIf { !it.isRecycled }?.recycle()
                                 processed?.takeIf { !it.isRecycled }?.recycle()
                                 source?.takeIf { !it.isRecycled }?.recycle()
-                                screen = Screen.Error(t.message ?: "Le traitement n'a pas pu être terminé.")
+                                val savedNote = if (savedToGallery) " La photo finale est déjà enregistrée dans Pictures/Ghazi." else ""
+                                screen = Screen.Error((t.message ?: "Le traitement n'a pas pu être terminé.") + savedNote)
                             } finally {
                                 current.file.delete()
                             }
@@ -171,10 +203,10 @@ fun ProductStudioApp() {
 
                 is Screen.Result -> ResultPage(
                     current = current,
-                    onSave = {
+                    onSaveCopy = {
                         appScope.launch {
                             runCatching { ImageTools.saveCachedResultToGallery(context, current.file) }
-                                .onSuccess { Toast.makeText(context, "Photo enregistrée dans Ghazi ✓", Toast.LENGTH_SHORT).show() }
+                                .onSuccess { Toast.makeText(context, "Une copie a été enregistrée ✓", Toast.LENGTH_SHORT).show() }
                                 .onFailure { Toast.makeText(context, it.message ?: "Erreur d'enregistrement", Toast.LENGTH_LONG).show() }
                         }
                     },
@@ -382,13 +414,17 @@ private fun ProcessingPage(text: String, progress: Int?) {
 }
 
 @Composable
-private fun ResultPage(current: Screen.Result, onSave: () -> Unit, onRetake: () -> Unit) {
+private fun ResultPage(current: Screen.Result, onSaveCopy: () -> Unit, onRetake: () -> Unit) {
     Column(
         Modifier.fillMaxSize().background(Color.White).padding(horizontal = 18.dp, vertical = 12.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         BrandHeader("Photo prête ✓")
         Text("${current.width} × ${current.height} px · Catalogue 4:5", fontSize = 14.sp, color = Color(0xFF666666))
+        if (current.autoSaved) {
+            Spacer(Modifier.height(4.dp))
+            Text("Enregistrée automatiquement dans Pictures/Ghazi ✓", fontSize = 14.sp, color = Color(0xFF2E6B3A))
+        }
         Spacer(Modifier.height(10.dp))
         Image(
             bitmap = current.preview.asImageBitmap(),
@@ -397,7 +433,7 @@ private fun ResultPage(current: Screen.Result, onSave: () -> Unit, onRetake: () 
             contentScale = ContentScale.Fit,
         )
         Spacer(Modifier.height(12.dp))
-        BigButton("ENREGISTRER", onClick = onSave)
+        BigButton("ENREGISTRER UNE COPIE", onClick = onSaveCopy)
         Spacer(Modifier.height(8.dp))
         BigButton("PRENDRE UNE AUTRE", onClick = onRetake, secondary = true)
         Signature()
