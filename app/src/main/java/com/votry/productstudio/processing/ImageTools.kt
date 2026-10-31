@@ -16,7 +16,7 @@ import kotlinx.coroutines.withContext
 object ImageTools {
     private const val PROCESSING_MAX_EDGE = 3200
     private const val SELECTION_MAX_EDGE = 1800
-    private const val PREVIEW_MAX_EDGE = 1600
+    private const val PREVIEW_MAX_EDGE = 1024
 
     fun decodeForProcessing(file: File): Bitmap = decodeOrientedBounded(file, PROCESSING_MAX_EDGE)
     fun decodeForSelection(file: File): Bitmap = decodeOrientedBounded(file, SELECTION_MAX_EDGE)
